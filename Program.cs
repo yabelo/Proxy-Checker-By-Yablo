@@ -1,21 +1,15 @@
 ﻿using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
-using System.Net.Http;
 using System.Net;
-using System.Net.Sockets;
+using System.Text;
 using System.Threading.Tasks;
-using System.Threading;
-using SocksSharp;
-using SocksSharp.Proxy;
 
 class ProxyChecker {
-
+    public static HashSet<string> checkedProxies = new HashSet<string>();
+    public static HashSet<string> goodProxies = new HashSet<string>();
 
     public static async Task Main() {
-        Console.Title = "Proxy Checker By Yablo";
-        WelcomeMessage.WelcomeMessage.ShowMessage();
-
         string proxyFilePath = PromptProxyFile();
         if (string.IsNullOrEmpty(proxyFilePath)) {
             Console.WriteLine("No proxy file selected. Exiting...");
@@ -23,53 +17,30 @@ class ProxyChecker {
         }
 
         string[] proxyList = File.ReadAllLines(proxyFilePath);
-        int proxyListLength = proxyList.Length;
 
-        Console.WriteLine($"Loaded {proxyListLength} proxies.");
+        Console.WriteLine($"Loaded {proxyList.Length} proxies.");
         Console.Clear();
-
-        int proxyType = PromptProxyType();
-
-        Console.Clear();
-
-        int counter = 0;
-        ConcurrentBag<string> goodProxies = new ConcurrentBag<string>();
 
         string proxyDirectory = Path.GetDirectoryName(proxyFilePath);
         string savePath = Path.Combine(proxyDirectory, "good_proxies.txt");
 
-        Parallel.ForEach(proxyList, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-            async (proxy) => {
-                int index = Interlocked.Increment(ref counter);
 
-                bool isProxyWorking = await CheckProxy(proxy, proxyType);
+        ServicePointManager.DefaultConnectionLimit = 20; // Set your preferred connection limit here
 
-                if (isProxyWorking) {
-                    Console.WriteLine($"\u001b[37m[{index}/{proxyListLength}]\u001b[37m | \u001b[35mProxy:\u001b[32m [ {proxy} ] is VALID.");
-                    goodProxies.Add(proxy);
-                    try {
-                        using (StreamWriter writer = new StreamWriter(savePath, true, System.Text.Encoding.UTF8)) {
-                            writer.WriteLine(proxy);
-                        }
-                    } catch (Exception ex) {
-                        Console.WriteLine("Error saving proxy: " + ex.Message);
-                    }
-                } else {
-                    Console.WriteLine($"\u001b[37m[{index}/{proxyListLength}]\u001b[37m | \u001b[35mProxy:\u001b[31m [ {proxy} ] is INVALID.");
-                }
-            });
+        int threadCount = Math.Min(Environment.ProcessorCount, proxyList.Length); // Limit threads based on available processors
 
+        List<Task> tasks = new List<Task>();
+
+        Parallel.ForEach(proxyList, new ParallelOptions { MaxDegreeOfParallelism = threadCount }, async (proxy, state, index) => {
+            if (!checkedProxies.Contains(proxy)) {
+                await CheckProxyAsync(proxy, proxyList.Length, savePath);
+            }
+        });
 
         Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine($"\nTotal good proxies: {goodProxies.Count}");
-        Console.Clear();
-
-        Console.WriteLine($"\nTotal good proxies: {goodProxies.Count}");
-        await Console.Out.WriteLineAsync($"Proxies saved into {savePath}");
-
-        Console.ReadLine();
+        Console.WriteLine("Proxy checking completed.");
+        Console.WriteLine($"{goodProxies.Count + 1} good proxies.");
     }
-
 
     public static string PromptProxyFile() {
         Console.WriteLine("Please enter the path to the proxy file:");
@@ -85,88 +56,61 @@ class ProxyChecker {
         return proxyFilePath;
     }
 
-    public static int PromptProxyType() {
-        while (true) {
-            Console.WriteLine("Proxy type:");
-            Console.WriteLine("1 | HTTP");
-            Console.WriteLine("2 | SOCKS4");
-            Console.WriteLine("3 | SOCKS5");
+    public static async Task CheckProxyAsync(string proxy, int totalProxies, string savePath) {
+        if (await CheckProxy(proxy)) {
+            lock (checkedProxies) {
+                if (!checkedProxies.Contains(proxy)) {
+                    checkedProxies.Add(proxy);
 
-            if (int.TryParse(Console.ReadLine(), out int proxyType) && (proxyType >= 1 && proxyType <= 3)) {
-                return proxyType;
-            } else {
-                Console.WriteLine("Invalid proxy type. Please try again.");
+                    Console.WriteLine($"\u001b[37m[{checkedProxies.Count}/{goodProxies.Count + 1}/{totalProxies}]\u001b[37m | \u001b[35mProxy:\u001b[32m [ {proxy} ] is VALID.");
+
+                    // Save the proxy to a file on the desktop
+                    try {
+                        goodProxies.Add(proxy);
+                        using (StreamWriter writer = new StreamWriter(savePath, true, Encoding.UTF8)) {
+                            writer.WriteLine(proxy);
+                        }
+                    } catch (Exception ex) {
+                        Console.WriteLine("Error saving proxy: " + ex.Message);
+                    }
+                }
+            }
+        } else {
+            lock (checkedProxies) {
+                if (!checkedProxies.Contains(proxy)) {
+                    checkedProxies.Add(proxy);
+
+                    Console.WriteLine($"\u001b[37m[{checkedProxies.Count}/{totalProxies}]\u001b[37m | \u001b[35mProxy:\u001b[31m [ {proxy} ] is INVALID.");
+                }
             }
         }
     }
 
-    public static async Task<bool> CheckProxy(string proxy, int proxyType) {
+    public static Task<bool> CheckProxy(string proxy) {
         string[] proxyParts = proxy.Split(':');
         string proxyAddress = proxyParts[0];
         int proxyPort = int.Parse(proxyParts[1]);
 
-        var settings = new ProxySettings() {
-            Host = proxyAddress,
-            Port = proxyPort
-        };
-
-
         try {
-
-            switch (proxyType) {
-                case 1:
-                    // Check for HTTP proxy
-                    using (var httpClientHandler = new HttpClientHandler {
-                        Proxy = new WebProxy(proxyAddress, proxyPort),
-                        UseProxy = true,
-                        AllowAutoRedirect = false
-                    })
-                    using (var httpClient = new HttpClient(httpClientHandler)) {
-                        httpClient.Timeout = TimeSpan.FromSeconds(10);
-                        var response = await httpClient.GetAsync("https://www.example.com");
-                        return response.IsSuccessStatusCode;
-                    }
-
-                case 2:
-                    // Check for SOCKS4 proxy
-
-                    using (var client = new TcpClient()) {
-                        await client.ConnectAsync(proxyAddress, proxyPort);
-                        var stream = client.GetStream();
-
-                        // Send the SOCKS4 handshake
-                        byte[] handshake = new byte[9];
-                        handshake[0] = 4; // SOCKS4 version
-                        handshake[1] = 1; // Command: establish TCP/IP stream
-                        handshake[2] = (byte)(proxyPort / 256);
-                        handshake[3] = (byte)(proxyPort % 256);
-                        byte[] ipBytes = IPAddress.Parse("0.0.0.1").GetAddressBytes(); // Destination IP (dummy IP)
-                        Array.Copy(ipBytes, 0, handshake, 4, 4);
-                        handshake[8] = 0; // Null byte to terminate the user ID field
-
-                        await stream.WriteAsync(handshake, 0, handshake.Length);
-
-                        // Read the SOCKS4 response
-                        byte[] response = new byte[8];
-                        await stream.ReadAsync(response, 0, response.Length);
-
-                        bool isProxyWorking = response[1] == 0x5A; // Check if response code is 0x5A (request granted)
-
-                        return isProxyWorking;
-                    }
-                case 3:
-                    // Check for SOCKS5 proxy
-                    using (var proxyClientHandler = new ProxyClientHandler<Socks5>(settings))
-                    using (var httpClient = new HttpClient(proxyClientHandler)) {
-                        var response = await httpClient.GetAsync("http://example.com/");
-                        return response.IsSuccessStatusCode;
-                    }
-            }
-
+            IWebProxy _proxy = new WebProxy(proxyAddress, proxyPort);
+            WebClient wc = new WebClient();
+            wc.Timeout = 10000;
+            wc.Proxy = _proxy;
+            wc.Encoding = Encoding.UTF8;
+            string result = wc.DownloadString("http://ip-api.com/line/?fields=8192");
+            return Task.FromResult(true);
         } catch {
-            // Proxy is not working
+            return Task.FromResult(false);
         }
+    }
+}
 
-        return false;
+public class WebClient : System.Net.WebClient {
+    public int Timeout { get; set; }
+    protected override WebRequest GetWebRequest(Uri uri) {
+        WebRequest lWebRequest = base.GetWebRequest(uri);
+        lWebRequest.Timeout = Timeout;
+        ((HttpWebRequest)lWebRequest).ReadWriteTimeout = Timeout;
+        return lWebRequest;
     }
 }
